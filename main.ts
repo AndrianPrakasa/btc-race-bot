@@ -6,8 +6,14 @@
 //
 //   - Entry: close at least 0.8% below its 240-bar simple moving average (a deep dip
 //     against the 4h trend), full cash, one position at a time.
-//   - Exit: take profit +2.0% from the entry close, stop loss -1.2%, or a 2.5%
-//     trailing stop from the peak close since entry. Whichever hits first.
+//   - Exit: take profit +2.0% from the entry close, stop loss -1.2%, a 2.5%
+//     trailing stop from the peak close since entry, or a 4-hour time stop
+//     (240 bars) if none of those has fired. Whichever hits first. The time
+//     stop matches the 4h horizon of the SMA240 signal: a dip that has not
+//     reverted in 4h is a stale thesis, so exit and free the cash for a fresh
+//     dip instead of riding a dead position to the end of the window. On the
+//     dev window this turns the second half from -$2.00 to +$7.48 in
+//     simulation (full window +$17.85 -> +$19.81) with max drawdown unchanged.
 //   - Fallbacks (only if it has never traded yet): if the window never dips, buy
 //     on a strong uptrend (close > SMA x 1.005 from bar 480), on any dip below the
 //     SMA (from bar 720), or at the market (from bar 1200). These never fire on the
@@ -19,8 +25,8 @@
 // the harness sends (price_scale 5); no floats, no clock, no randomness, no
 // network, no files. Deterministic: the same bars always give the same orders.
 //
-// Dev-window behaviour (local grade, see README): 1 round trip + 1 final hold,
-// net PnL about +$17.9 in simulation, max drawdown about -0.7%.
+// Dev-window behaviour (local grade, see README): 2 round trips, net PnL
+// about +$19.8 in simulation, max drawdown about -0.7%.
 
 import { runBars, type BarsState, type OrderInput } from './vendor/makefun-bars.ts';
 
@@ -34,6 +40,8 @@ const TP_BPS = 200; // 2.0%
 const SL_BPS = 120; // 1.2%
 /** Trailing stop: close <= peak * (1 - TRAIL_BPS/10000). */
 const TRAIL_BPS = 250; // 2.5%
+/** Time stop: exit after this many bars held without TP/SL/trailing firing. */
+const MAX_HOLD_BARS = 240; // 4h, the same horizon as the SMA240 signal
 const MAX_SLIPPAGE_BPS = 300; // 3%: far above the ~13 bps a fill normally moves
 
 /** Latest close per batch seq (null before the first bar / on a missing bar). */
@@ -42,6 +50,8 @@ const closes: (bigint | null)[] = [];
 let entryClose = 0n;
 /** Highest close seen while the current position is open; 0n when flat. */
 let peakClose = 0n;
+/** Bars held in the current position (time stop); 0 when flat. */
+let holdBars = 0;
 /** True once a buy order has been sent (so the fallbacks only fire pre-trade). */
 let everTraded = false;
 
@@ -90,20 +100,25 @@ await runBars({
       everTraded = true;
       entryClose = close;
       peakClose = close;
+      holdBars = 0;
       return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: notional, max_slippage_bps: MAX_SLIPPAGE_BPS }];
     }
 
     // --- Holding: exits ------------------------------------------------------
     if (close > peakClose) peakClose = close;
+    holdBars += 1;
     // close >= entry * (1 + TP_BPS/10000)
     const takeProfit = close * 10000n >= entryClose * BigInt(10000 + TP_BPS);
     // close <= entry * (1 - SL_BPS/10000)
     const stopLoss = close * 10000n <= entryClose * BigInt(10000 - SL_BPS);
     // close <= peak * (1 - TRAIL_BPS/10000)
     const trailing = close * 10000n <= peakClose * BigInt(10000 - TRAIL_BPS);
-    if (!takeProfit && !stopLoss && !trailing) return [];
+    // Time stop: the dip thesis is stale after MAX_HOLD_BARS.
+    const timeStop = holdBars >= MAX_HOLD_BARS;
+    if (!takeProfit && !stopLoss && !trailing && !timeStop) return [];
     entryClose = 0n;
     peakClose = 0n;
+    holdBars = 0;
     const sell: OrderInput = { side: 'sell', symbol: SYMBOL, qty: heldQty, max_slippage_bps: MAX_SLIPPAGE_BPS };
     return [sell];
   },
