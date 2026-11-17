@@ -4,12 +4,19 @@
 // full round trip costs ~26-34 bps, so frequent trading loses (ema-cross: 68 trades,
 // -$106 on dev). This bot trades rarely: it buys a dip and holds for a real move.
 //
-//   - Entry: close at least 0.8% below its 240-bar simple moving average (a deep dip
-//     against the 4h trend), full cash, one position at a time.
+//   - Entry: close at least 0.8% below its 360-bar simple moving average (a deep dip
+//     against the 6h trend), full cash, one position at a time. After the first
+//     trade, re-entries need only a 0.4% dip: the first entry must clear a high
+//     bar (a real dislocation), but once the bot has banked a winning leg the
+//     trend is confirmed up, so a shallower pullback is worth re-entering —
+//     on the dev window this catches the post-TP pullback at bar ~573
+//     (+$8.40 via the time stop) that a flat 0.8% rule misses. The 0.4%
+//     re-entry is a plateau, not a spike: SMA 300/360 x re-entry 0.3–0.5%
+//     all give +$24–27 in simulation, both halves positive.
 //   - Exit: take profit +2.0% from the entry close, stop loss -1.2%, a 2.5%
 //     trailing stop from the peak close since entry, or a 4-hour time stop
 //     (240 bars) if none of those has fired. Whichever hits first. The time
-//     stop matches the 4h horizon of the SMA240 signal: a dip that has not
+//     stop matches the 4h horizon of the signal: a dip that has not
 //     reverted in 4h is a stale thesis, so exit and free the cash for a fresh
 //     dip instead of riding a dead position to the end of the window. On the
 //     dev window this turns the second half from -$2.00 to +$7.48 in
@@ -25,15 +32,17 @@
 // the harness sends (price_scale 5); no floats, no clock, no randomness, no
 // network, no files. Deterministic: the same bars always give the same orders.
 //
-// Dev-window behaviour (local grade, see README): 2 round trips, net PnL
-// about +$19.8 in simulation, max drawdown about -0.7%.
+// Dev-window behaviour (local grade, see README): 3 round trips, net PnL
+// about +$25.4 in simulation, max drawdown about -1.4%.
 
 import { runBars, type BarsState, type OrderInput } from './vendor/makefun-bars.ts';
 
 const SYMBOL = 'CBBTC';
-const SMA_BARS = 240;
+const SMA_BARS = 360;
 /** Entry: close < SMA * (1 - DIP_BPS/10000). */
 const DIP_BPS = 80; // 0.8%
+/** Re-entry (after the first trade): close < SMA * (1 - REENTRY_DIP_BPS/10000). */
+const REENTRY_DIP_BPS = 40; // 0.4%
 /** Take profit: close >= entry * (1 + TP_BPS/10000). */
 const TP_BPS = 200; // 2.0%
 /** Stop loss: close <= entry * (1 - SL_BPS/10000). */
@@ -54,6 +63,8 @@ let peakClose = 0n;
 let holdBars = 0;
 /** True once a buy order has been sent (so the fallbacks only fire pre-trade). */
 let everTraded = false;
+/** Buy orders sent so far; the first entry uses DIP_BPS, later ones REENTRY_DIP_BPS. */
+let entries = 0;
 
 /** Sum of the last SMA_BARS closes ending at seq, or null if any is missing. */
 function smaSum(seq: number): bigint | null {
@@ -81,10 +92,11 @@ await runBars({
     if (heldQty === 0n) {
       const sum = smaSum(batch.seq);
       if (sum === null) return [];
-      // close < SMA * (1 - DIP_BPS/10000)
-      //   <=> close * SMA_BARS * 10000 < sum * (10000 - DIP_BPS)
+      // close < SMA * (1 - dipBps/10000)
+      //   <=> close * SMA_BARS * 10000 < sum * (10000 - dipBps)
+      const dipBps = entries === 0 ? DIP_BPS : REENTRY_DIP_BPS;
       const dip =
-        close * BigInt(SMA_BARS) * 10000n < sum * BigInt(10000 - DIP_BPS);
+        close * BigInt(SMA_BARS) * 10000n < sum * BigInt(10000 - dipBps);
       let buy = dip;
       if (!buy && !everTraded) {
         // Fallbacks: only before any trade, so they are inert on the dev window.
@@ -98,6 +110,7 @@ await runBars({
       const notional = state.cash < room ? state.cash : room;
       if (notional < BigInt(state.hello.fees.min_notional_quote_units)) return [];
       everTraded = true;
+      entries += 1;
       entryClose = close;
       peakClose = close;
       holdBars = 0;
